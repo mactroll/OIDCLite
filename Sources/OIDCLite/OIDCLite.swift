@@ -2,9 +2,9 @@ import Foundation
 import CryptoKit
 
 public struct OIDCLiteTokenResponse {
-    var accessToken: String?
-    var idToken: String?
-    var refreshToken: String?
+    public var accessToken: String?
+    public var idToken: String?
+    public var refreshToken: String?
 }
 
 public protocol OIDCLiteDelegate {
