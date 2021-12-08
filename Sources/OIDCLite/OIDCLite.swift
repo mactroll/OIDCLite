@@ -202,8 +202,8 @@ public class OIDCLite {
         dataTask?.resume()
     }
     
-    /// Private function to parse the openid-configuration file into all of the requisite endpoints
-    private func getEndpoints() {
+    /// Function to parse the openid-configuration file into all of the requisite endpoints
+    public func getEndpoints() {
         
         // make sure we can actually make a URL from the discoveryURL that we have
         guard let host = URL(string: discoveryURL) else { return }
