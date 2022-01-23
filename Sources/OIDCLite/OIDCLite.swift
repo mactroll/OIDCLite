@@ -1,5 +1,6 @@
 import Foundation
 import CryptoKit
+import WebKit
 
 public struct OIDCLiteTokenResponse {
     public var accessToken: String?
@@ -12,7 +13,7 @@ public protocol OIDCLiteDelegate {
     func tokenResponse(tokens: OIDCLiteTokenResponse)
 }
 
-public class OIDCLite {
+public class OIDCLite: NSObject {
     
     // Constants, in case nothing else is supplied
     
@@ -45,7 +46,7 @@ public class OIDCLite {
     // delegate for callbacks
     
     public var delegate: OIDCLiteDelegate?
-
+    
     private var state: String?
     private let queryItemKeys = OIDCQueryItemKeys()
     
@@ -62,7 +63,7 @@ public class OIDCLite {
     
     /// Create a new OIDCLite object
     /// - Parameters:
-    ///   - discoveryURL: the well-known openid-configuration URL, e.g. https://my.idp.com/.well-known/openid-configuration
+    ///   - discoveryURL: the full well-known openid-configuration URL, e.g. https://my.idp.com/.well-known/openid-configuration
     ///   - clientID: the OpenID Connect client ID to be used
     ///   - clientSecret: optional OpenID Connect client secret
     ///   - redirectURI: optional redirect URI, can not be http or https. Defaults to "oidclite://openID" if nothing is supplied
@@ -72,8 +73,8 @@ public class OIDCLite {
         self.discoveryURL = discoveryURL
         self.clientID = clientID
         self.clientSecret = clientSecret
-        self.redirectURI = redirectURI ?? kRedirectURI
-        self.scopes = scopes ?? kDefaultScopes
+        self.redirectURI = redirectURI ?? "oidclite://openID"
+        self.scopes = scopes ?? ["openid", "profile", "email", "offline_access"]
     }
     
     /// Generates the inital login URL which can be passed to ASWebAuthenticationSession
@@ -91,7 +92,7 @@ public class OIDCLite {
         
         responseTypeItem = URLQueryItem(name: queryItemKeys.responseType, value: "code")
         scopeItem = URLQueryItem(name: queryItemKeys.scope, value: scopes.joined(separator: " "))
-
+        
         queryItems.append(contentsOf: [responseTypeItem, scopeItem])
         
         let redirectUriItem = URLQueryItem(name: queryItemKeys.redirectUri, value: redirectURI)
@@ -165,8 +166,8 @@ public class OIDCLite {
                 self.delegate?.authFailure(message: error.localizedDescription)
                 
             } else if let data = data,
-                let response = response as? HTTPURLResponse,
-                response.statusCode == 200 {
+                      let response = response as? HTTPURLResponse,
+                      response.statusCode == 200 {
                 var tokenResponse = OIDCLiteTokenResponse()
                 do {
                     let jsonResult = try JSONSerialization.jsonObject(with: data, options: JSONSerialization.ReadingOptions.mutableContainers) as? Dictionary<String, Any>
@@ -182,7 +183,7 @@ public class OIDCLite {
                     if let idToken = jsonResult?["id_token"] as? String {
                         tokenResponse.idToken = idToken
                     }
-                        
+                    
                     self.delegate?.tokenResponse(tokens: tokenResponse)
                 } catch {
                     self.delegate?.authFailure(message: "Unable to decode response")
@@ -225,20 +226,57 @@ public class OIDCLite {
             if let error = error {
                 print(error.localizedDescription)
             } else if let data = data,
-                let response = response as? HTTPURLResponse,
-                response.statusCode == 200 {
+                      let response = response as? HTTPURLResponse,
+                      response.statusCode == 200 {
                 
                 // if we got a 200 find the auth and token endpoints
                 
                 if let json = try? JSONSerialization.jsonObject(with: data) as? [ String : Any] {
-                        self.OIDCAuthEndpoint = json["authorization_endpoint"] as? String ?? ""
-                        self.OIDCTokenEndpoint = json["token_endpoint"] as? String ?? ""
-                    }
+                    self.OIDCAuthEndpoint = json["authorization_endpoint"] as? String ?? ""
+                    self.OIDCTokenEndpoint = json["token_endpoint"] as? String ?? ""
                 }
+            }
             sema.signal()
         }
         
         dataTask?.resume()
         sema.wait()
+    }
+    
+    /// Parse the response  from a redirect with a possible code in it.
+    /// - Parameter url: redirect URL
+    public func processResponseURL(url: URL) throws {
+        if let query = url.query {
+            let items = query.components(separatedBy: "&")
+            for item in items {
+                if item.starts(with: "code=") {
+                    getToken(code: item.replacingOccurrences(of: "code=", with: ""))
+                    return
+                }
+            }
+        }
+        throw OIDCLiteError.unableToFindCode
+    }
+}
+
+// Allow OIDCLite to be used as a WKNavigationDelegate
+// This works for when you're not using ASWebAuthenticationSession
+
+extension OIDCLite: WKNavigationDelegate {
+    
+    public func webView(_ webView: WKWebView, didReceiveServerRedirectForProvisionalNavigation navigation: WKNavigation!) {
+        
+        if (webView.url?.absoluteString.starts(with: (redirectURI))) ?? false {
+            var code = ""
+            let fullCommand = webView.url?.absoluteString ?? ""
+            let pathParts = fullCommand.components(separatedBy: "&")
+            for part in pathParts {
+                if part.contains("code=") {
+                    code = part.replacingOccurrences(of: redirectURI + "?" , with: "").replacingOccurrences(of: "code=", with: "")
+                    self.getToken(code: code)
+                    return
+                }
+            }
+        }
     }
 }
