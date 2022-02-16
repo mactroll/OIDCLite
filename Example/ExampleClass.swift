@@ -10,7 +10,7 @@ import Foundation
 // need to import this to use ASWebAuthentication
 import AuthenticationServices
 
-class ASWebAuthManager {
+class ASWebAuthManager: NSObject {
     // need to keep a strong reference to the authentication session
     var authSession: ASWebAuthenticationSession?
     

@@ -6,6 +6,7 @@ public struct OIDCLiteTokenResponse {
     public var accessToken: String?
     public var idToken: String?
     public var refreshToken: String?
+    public var jsonDict: [String:Any]?
 }
 
 public protocol OIDCLiteDelegate {
@@ -183,7 +184,7 @@ public class OIDCLite: NSObject {
                     if let idToken = jsonResult?["id_token"] as? String {
                         tokenResponse.idToken = idToken
                     }
-                    
+                    tokenResponse.jsonDict = jsonResult
                     self.delegate?.tokenResponse(tokens: tokenResponse)
                 } catch {
                     self.delegate?.authFailure(message: "Unable to decode response")
