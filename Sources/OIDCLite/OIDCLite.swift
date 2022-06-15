@@ -28,6 +28,8 @@ public class OIDCLite: NSObject {
     public let clientID: String
     public let scopes: [String]
     public let clientSecret: String?
+    public let additionalParameters:Dictionary<String,String>?
+
     
     // OpenID endpoints, gathered from the discoveryURL
     
@@ -70,12 +72,13 @@ public class OIDCLite: NSObject {
     ///   - redirectURI: optional redirect URI, can not be http or https. Defaults to "oidclite://openID" if nothing is supplied
     ///   - scopes: optional custom scopes to be used in the OpenID Connect request. If nothing is supplied ["openid", "profile", "email", "offline_access"] will be used
     ///
-    public init(discoveryURL: String, clientID: String, clientSecret: String?, redirectURI: String?, scopes: [String]?) {
+    public init(discoveryURL: String, clientID: String, clientSecret: String?, redirectURI: String?, scopes: [String]?, additionalParameters: Dictionary<String, String>? = nil) {
         self.discoveryURL = discoveryURL
         self.clientID = clientID
         self.clientSecret = clientSecret
         self.redirectURI = redirectURI ?? "oidclite://openID"
         self.scopes = scopes ?? ["openid", "profile", "email", "offline_access"]
+        self.additionalParameters = additionalParameters
     }
     
     /// Generates the inital login URL which can be passed to ASWebAuthenticationSession
@@ -93,9 +96,19 @@ public class OIDCLite: NSObject {
         
         responseTypeItem = URLQueryItem(name: queryItemKeys.responseType, value: "code")
         scopeItem = URLQueryItem(name: queryItemKeys.scope, value: scopes.joined(separator: " "))
-        
+
+
         queryItems.append(contentsOf: [responseTypeItem, scopeItem])
-        
+
+        if let additionalParameters = additionalParameters {
+            additionalParameters.forEach { k,v in
+
+                let parameterItem = URLQueryItem(name: k, value: v)
+                queryItems.append(contentsOf: [parameterItem])
+
+            }
+        }
+
         let redirectUriItem = URLQueryItem(name: queryItemKeys.redirectUri, value: redirectURI)
         queryItems.append(redirectUriItem)
         let stateItem = URLQueryItem(name: queryItemKeys.state, value: state)
@@ -193,7 +206,6 @@ public class OIDCLite: NSObject {
                 if data != nil {
                     do {
                         let jsonResult = try JSONSerialization.jsonObject(with: data!, options: JSONSerialization.ReadingOptions.mutableContainers) as? Dictionary<String, Any>
-                        print(jsonResult as Any)
                     } catch {
                         print("No data")
                     }
