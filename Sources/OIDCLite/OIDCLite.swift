@@ -33,6 +33,23 @@ struct IntConvertible: Decodable {
     }
 }
 
+extension CharacterSet {
+  static let urlQueryValueAllowed: CharacterSet = {
+    // https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/encodeURIComponent
+    // https://url.spec.whatwg.org/#concept-urlencoded
+    // A-z0-9 and '*.-_' are allowed
+    let generalDelimitersToEncode = ":#[]@?/"
+    let subDelimitersToEncode = "!$&'()+,;=~"
+
+    var allowed = CharacterSet.urlQueryAllowed
+    allowed.remove(charactersIn: "\(generalDelimitersToEncode)\(subDelimitersToEncode)")
+    // replace space with + afterwards
+    allowed.insert(charactersIn: " ")
+    return allowed
+  }()
+}
+
+
 struct RefreshTokenResponse: Decodable {
     let accessToken, refreshToken, tokenType: String
     @IntConvertible var expiresIn: Int
@@ -378,11 +395,16 @@ public class OIDCLite: NSObject {
             return
         }
         let base64LoginString = loginData.base64EncodedString()
-        let scopesURLString = scopes.joined(separator: " ")
-        guard let parameters = "grant_type=password&username=\(username)&password=\(password)&scope=\(scopesURLString)".addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) else {
+        let scopesURLString = scopes.joined(separator: " ").addingPercentEncoding(withAllowedCharacters: .urlQueryValueAllowed)?.replacingOccurrences(of: " ", with: "+")
+        let encodedUsername = username.addingPercentEncoding(withAllowedCharacters: .urlQueryValueAllowed)?.replacingOccurrences(of: " ", with: "+")
+        let encodedPassword = password.addingPercentEncoding(withAllowedCharacters: .urlQueryValueAllowed)?.replacingOccurrences(of: " ", with: "+")
+
+        guard let encodedUsername = encodedUsername, let encodedPassword = encodedPassword, let scopesURLString = scopesURLString else {
             self.delegate?.authFailure(message: "bad scopesURLString")
             return
         }
+        let parameters = "grant_type=password&username=\(encodedUsername)&password=\(encodedPassword)&scope=\(scopesURLString)"
+
         guard let postData =  parameters.data(using: .utf8) else {
             self.delegate?.authFailure(message: "bad parameter data")
             return
