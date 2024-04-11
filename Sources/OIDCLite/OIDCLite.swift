@@ -269,16 +269,20 @@ public class OIDCLite: NSObject {
             } else {
                 if data != nil {
                     do {
-                        let jsonResult = try JSONSerialization.jsonObject(with: data!, options: JSONSerialization.ReadingOptions.mutableContainers) as? Dictionary<String, Any>
+                        if let jsonResult = try JSONSerialization.jsonObject(with: data!, options: JSONSerialization.ReadingOptions.mutableContainers) as? Dictionary<String, Any> {
+                            self.delegate?.authFailure(message: self.prettyPrintInfo(dict: jsonResult))
+                        }
+                        self.delegate?.authFailure(message: response.debugDescription)
                     } catch {
                         print("No data")
+                        self.delegate?.authFailure(message: response.debugDescription)
+
                     }
                 }
                 self.delegate?.authFailure(message: response.debugDescription)
             }
         }
         dataTask?.resume()
-
     }
     
     /// Function to parse the openid-configuration file into all of the requisite endpoints
@@ -428,6 +432,19 @@ public class OIDCLite: NSObject {
 
         task.resume()
 
+    }
+    
+    private func prettyPrintInfo(dict: [String:Any]) -> String {
+        
+        var result = ""
+        
+        for item in dict {
+            result.append("\(item.key):  ")
+            result.append(String.init(describing: item.value))
+            result.append("\n")
+        }
+        
+        return result
     }
 }
 
