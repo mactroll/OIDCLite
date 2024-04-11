@@ -276,15 +276,16 @@ public class OIDCLite: NSObject {
                     do {
                         if let jsonResult = try JSONSerialization.jsonObject(with: data!, options: JSONSerialization.ReadingOptions.mutableContainers) as? Dictionary<String, Any> {
                             self.delegate?.authFailure(message: self.prettyPrintInfo(dict: jsonResult))
+                        } else {
+                            self.delegate?.authFailure(message: response.debugDescription)
                         }
-                        self.delegate?.authFailure(message: response.debugDescription)
                     } catch {
                         print("No data")
                         self.delegate?.authFailure(message: response.debugDescription)
-
                     }
+                } else {
+                    self.delegate?.authFailure(message: response.debugDescription)
                 }
-                self.delegate?.authFailure(message: response.debugDescription)
             }
         }
         dataTask?.resume()
