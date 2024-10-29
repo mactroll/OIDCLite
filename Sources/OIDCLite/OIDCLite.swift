@@ -15,6 +15,7 @@ public enum OIDCLiteTokenResult {
 public protocol OIDCLiteDelegate {
     func authFailure(message: String)
     func tokenResponse(tokens: OIDCLite.TokenResponse)
+
 }
 
 
@@ -89,6 +90,7 @@ public class OIDCLite: NSObject {
     public let clientID: String
     public let scopes: [String]
     public let clientSecret: String?
+    public let resource:String?
     public let additionalParameters:Dictionary<String,String>?
 
     // OpenID endpoints, gathered from the discoveryURL
@@ -139,6 +141,18 @@ public class OIDCLite: NSObject {
         self.redirectURI = redirectURI ?? "oidclite://openID"
         self.scopes = scopes ?? ["openid", "profile", "email", "offline_access"]
         self.additionalParameters = additionalParameters
+        self.resource=nil
+    }
+
+
+    public init(discoveryURL: String, clientID: String, clientSecret: String?, redirectURI: String?, scopes: [String]?, additionalParameters: Dictionary<String, String>? = nil, useROPG:Bool=false, ropgUsername:String?=nil, ropgPassword:String?=nil, resource:String?=nil) {
+        self.discoveryURL = discoveryURL
+        self.clientID = clientID
+        self.clientSecret = clientSecret
+        self.redirectURI = redirectURI ?? "oidclite://openID"
+        self.scopes = scopes ?? ["openid", "profile", "email", "offline_access"]
+        self.additionalParameters = additionalParameters
+        self.resource=resource
     }
     
     /// Generates the inital login URL which can be passed to ASWebAuthenticationSession
@@ -201,6 +215,7 @@ public class OIDCLite: NSObject {
         do {
             let jsonResult = try JSONSerialization.jsonObject(with: data, options: JSONSerialization.ReadingOptions.mutableContainers) as? Dictionary<String, Any>
 
+
             if let accessToken = jsonResult?["access_token"] as? String {
                 tokenResponse.accessToken = accessToken
             }
@@ -216,7 +231,7 @@ public class OIDCLite: NSObject {
 
             self.delegate?.tokenResponse(tokens: tokenResponse)
         } catch {
-            self.delegate?.authFailure(message: "Unable to decode response")
+            self.delegate?.authFailure(message: "Unable to decode response: \(data.base64EncodedString())")
         }
     }
     /// Turn a code, returned from a successful ASWebAuthenticationSession, into a token set
@@ -227,7 +242,7 @@ public class OIDCLite: NSObject {
             delegate?.authFailure(message: "No token endpoint found")
             return
         }
-        
+
         guard let tokenURL = URL(string: path) else {
             delegate?.authFailure(message: "Unable to make the token endpoint into a URL")
             return
@@ -407,7 +422,21 @@ public class OIDCLite: NSObject {
             self.delegate?.authFailure(message: "bad scopesURLString")
             return
         }
-        let parameters = "grant_type=password&username=\(encodedUsername)&password=\(encodedPassword)&scope=\(scopesURLString)"
+        var parameters = "grant_type=password&username=\(encodedUsername)&password=\(encodedPassword)&scope=\(scopesURLString)"
+
+        if let resource = resource, let encodedResource = resource.addingPercentEncoding(withAllowedCharacters: .urlQueryValueAllowed)?.replacingOccurrences(of: " ", with: "+"){
+
+            parameters += "&resource=\(encodedResource)"
+        }
+        if let encodedClientID = clientID.addingPercentEncoding(withAllowedCharacters: .urlQueryValueAllowed)?.replacingOccurrences(of: " ", with: "+"){
+
+            parameters += "&client_id=\(encodedClientID)"
+        }
+
+        if let clientSecret = clientSecret, let encodedSecret = clientSecret.addingPercentEncoding(withAllowedCharacters: .urlQueryValueAllowed)?.replacingOccurrences(of: " ", with: "+"){
+
+            parameters += "&client_secret=\(encodedSecret)"
+        }
 
         guard let postData =  parameters.data(using: .utf8) else {
             self.delegate?.authFailure(message: "bad parameter data")
