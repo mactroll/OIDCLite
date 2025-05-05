@@ -403,15 +403,19 @@ public class OIDCLite: NSObject {
             "Cache-Control": "no-cache",
             "Content-Type" : "application/x-www-form-urlencoded"
         ]
-        
+
+        let scopesURLString = scopes.joined(separator: " ").addingPercentEncoding(withAllowedCharacters: .urlQueryValueAllowed)?.replacingOccurrences(of: " ", with: "+")
+        let encodedUsername = username.addingPercentEncoding(withAllowedCharacters: .urlQueryValueAllowed)?.replacingOccurrences(of: " ", with: "+")
+        let encodedPassword = password.addingPercentEncoding(withAllowedCharacters: .urlQueryValueAllowed)?.replacingOccurrences(of: " ", with: "+")
+
         var reqComponents = URLComponents()
         var queryItems = [
             URLQueryItem(name: queryItemKeys.grantType, value: "password"),
-            URLQueryItem(name: queryItemKeys.scope, value: scopes.joined(separator: " ")),
-            URLQueryItem(name: queryItemKeys.username, value: username),
-            URLQueryItem(name: queryItemKeys.password, value: password)
+            URLQueryItem(name: queryItemKeys.scope, value: scopesURLString),
+            URLQueryItem(name: queryItemKeys.username, value: encodedUsername),
+            URLQueryItem(name: queryItemKeys.password, value: encodedPassword)
         ]
-        
+
         if !basicAuth {
             queryItems.append(URLQueryItem(name: "client_id", value: clientID))
             if let clientSecret = clientSecret {
