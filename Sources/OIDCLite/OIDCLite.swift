@@ -134,6 +134,7 @@ public class OIDCLite: NSObject {
         let grantType = "grant_type"
         let username = "username"
         let password = "password"
+        let resource = "resource"
     }
     
     /// Create a new OIDCLite object
@@ -367,7 +368,7 @@ public class OIDCLite: NSObject {
         if let clientSecret = clientSecret {
             parameters.append("&client_secret=\(clientSecret)")
         }
-        
+
         let postData =  parameters.data(using: .utf8)
         
         guard let path = OIDCTokenEndpoint else {
@@ -416,6 +417,11 @@ public class OIDCLite: NSObject {
             URLQueryItem(name: queryItemKeys.password, value: encodedPassword)
         ]
 
+        if let resource = resource, let encodedResource = resource.addingPercentEncoding(withAllowedCharacters: .urlQueryValueAllowed)?.replacingOccurrences(of: " ", with: "+"){
+
+            queryItems.append(URLQueryItem(name: queryItemKeys.resource, value: encodedResource))
+
+        }
         if !basicAuth {
             queryItems.append(URLQueryItem(name: "client_id", value: clientID))
             if let clientSecret = clientSecret {
