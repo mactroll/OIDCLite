@@ -445,6 +445,12 @@ public class OIDCLite: NSObject {
         req.httpBody = reqComponents.query?.data(using: .utf8)
         
         let (data, response) = try await URLSession.shared.data(for: req)
+        
+        var responseCode = 0
+        if let response = response as? HTTPURLResponse{
+            responseCode = response.statusCode
+        
+        }
         if let response = response as? HTTPURLResponse,
            (200...228).contains(response.statusCode) {
             let tokenResponse =  try await self.processOIDCResponse(data)
@@ -455,7 +461,7 @@ public class OIDCLite: NSObject {
                   let errorMessage = String(data: data, encoding: .utf8) {
             var success = false
             for i in overrideErrors {
-                if i == errorMessage {
+                if errorMessage.contains(i) {
                     success = true
                     break
                 }
@@ -470,11 +476,11 @@ public class OIDCLite: NSObject {
                 return nil
             }
             else {
-                throw OIDCLiteError.authFailure(String(data: data, encoding: .utf8) ?? "Unknown error")
+                throw OIDCLiteError.authFailure("Status code:\(responseCode), Did not match override:"+(String(data: data, encoding: .utf8) ?? "Unknown error"))
             }
 
         } else {
-            throw OIDCLiteError.authFailure(String(data: data, encoding: .utf8) ?? "Unknown error")
+            throw OIDCLiteError.authFailure("Status code:\(responseCode), Not 400, no override, or bad error message:"+(String(data: data, encoding: .utf8) ?? "Unknown error"))
         }
     }
     
