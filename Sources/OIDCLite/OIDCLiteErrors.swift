@@ -8,7 +8,7 @@
 import Foundation
 
 public enum OIDCLiteError: Error {
-    case unableToFindCode, unableToLoadEndpoint, unableToParseEndpoint
+    case unableToFindCode, unableToLoadEndpoint, unableToParseEndpoint,tokenError(String),authFailure(String)
 }
 
 extension OIDCLiteError {
@@ -20,6 +20,11 @@ extension OIDCLiteError {
             return "Unable to load OIDC discovery endpoint"
         case .unableToParseEndpoint:
             return "Unable to parse OIDC discovery endpoint"
+        case .authFailure:
+            return "Authentication Failure"
+        case .tokenError:
+            return "Token Error"
+
         }
     }
 }
