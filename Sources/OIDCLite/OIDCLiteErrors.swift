@@ -9,6 +9,7 @@ import Foundation
 
 public enum OIDCLiteError: Error {
     case unableToFindCode
+    case invalidState
 }
 
 extension OIDCLiteError {
@@ -16,6 +17,8 @@ extension OIDCLiteError {
         switch self {
         case .unableToFindCode:
             return "Unable to parse code from URL"
+        case .invalidState:
+            return "State parameter mismatch — possible CSRF attack"
         }
     }
 }
