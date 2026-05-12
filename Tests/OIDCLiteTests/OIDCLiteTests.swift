@@ -121,7 +121,20 @@ final class OIDCLiteTests: XCTestCase {
         XCTAssertEqual(items["acr_values"], "urn:test")
     }
 
-    // MARK: - State / CSRF
+    // MARK: - Reserved parameter protection (M2)
+
+    func testAdditionalParametersCannotOverrideReservedParams() {
+        let evil = ["prompt": "login", "client_id": "evil-client", "state": "attacker-state", "nonce": "attacker-nonce"]
+        let oidc = OIDCLite(discoveryURL: discoveryURL, clientID: clientID, clientSecret: nil, redirectURI: nil, scopes: nil, additionalParameters: evil)
+        oidc.OIDCAuthEndpoint = authEndpoint
+        let items = loginQueryItems(oidc)
+        XCTAssertEqual(items["client_id"], clientID, "Reserved param client_id must not be overridden")
+        XCTAssertNotEqual(items["state"], "attacker-state", "Reserved param state must not be overridden")
+        XCTAssertNotEqual(items["nonce"], "attacker-nonce", "Reserved param nonce must not be overridden")
+        XCTAssertEqual(items["prompt"], "login", "Non-reserved param should be included")
+    }
+
+    // MARK: - State / CSRF (C2)
 
     func testCreateLoginURLContainsNonEmptyState() {
         let oidc = makeOIDC()
@@ -137,8 +150,7 @@ final class OIDCLiteTests: XCTestCase {
         XCTAssertNotEqual(state1, state2, "State must be unique per request to prevent CSRF")
     }
 
-    // SECURITY: state returned in redirect must be validated against the value sent in the request.
-    // Without this check, an attacker can forge a redirect and hijack the auth flow.
+    // SECURITY: state returned in redirect must match the value sent, or the flow must abort.
     func testProcessResponseURLRejectsWrongState() {
         let oidc = makeOIDC()
         _ = oidc.createLoginURL()
@@ -158,7 +170,7 @@ final class OIDCLiteTests: XCTestCase {
     }
 
     func testProcessResponseURLRejectsCallbackWithNoLoginInitiated() {
-        // No createLoginURL() called — no state set; any callback must be rejected.
+        // No createLoginURL() → no stored state → any callback must be rejected
         let oidc = makeOIDC()
         let url = URL(string: "oidclite://openID?code=abc123&state=some_state")!
         XCTAssertThrowsError(try oidc.processResponseURL(url: url)) { error in
@@ -168,18 +180,39 @@ final class OIDCLiteTests: XCTestCase {
 
     func testProcessResponseURLAcceptsCorrectState() throws {
         let oidc = makeOIDC()
-        oidc.OIDCTokenEndpoint = tokenEndpoint
         let loginURL = oidc.createLoginURL()!
         let state = urlQueryItems(loginURL)["state"]!
         let callbackURL = URL(string: "oidclite://openID?code=abc123&state=\(state)")!
         XCTAssertNoThrow(try oidc.processResponseURL(url: callbackURL))
     }
 
-    // MARK: - processResponseURL code extraction
+    func testStateIsConsumedAfterSuccessfulValidation() throws {
+        let oidc = makeOIDC()
+        let loginURL = oidc.createLoginURL()!
+        let state = urlQueryItems(loginURL)["state"]!
+        let callbackURL = URL(string: "oidclite://openID?code=abc123&state=\(state)")!
+        try? oidc.processResponseURL(url: callbackURL)
+        // Replaying the same URL must now fail
+        XCTAssertThrowsError(try oidc.processResponseURL(url: callbackURL)) { error in
+            XCTAssertEqual(error as? OIDCLiteError, OIDCLiteError.invalidState)
+        }
+    }
+
+    // MARK: - Redirect URI validation (M5)
+
+    func testProcessResponseURLRejectsWrongRedirectURI() {
+        let oidc = makeOIDC()
+        _ = oidc.createLoginURL()
+        let url = URL(string: "evil://callback?code=abc123&state=any")!
+        XCTAssertThrowsError(try oidc.processResponseURL(url: url)) { error in
+            XCTAssertEqual(error as? OIDCLiteError, OIDCLiteError.invalidRedirectURI)
+        }
+    }
+
+    // MARK: - processResponseURL code extraction (C5)
 
     func testProcessResponseURLThrowsWhenNoCode() {
         let oidc = makeOIDC()
-        oidc.OIDCTokenEndpoint = tokenEndpoint
         let loginURL = oidc.createLoginURL()!
         let state = urlQueryItems(loginURL)["state"]!
         let url = URL(string: "oidclite://openID?error=access_denied&state=\(state)")!
@@ -195,7 +228,7 @@ final class OIDCLiteTests: XCTestCase {
         XCTAssertThrowsError(try oidc.processResponseURL(url: url))
     }
 
-    // MARK: - PKCE
+    // MARK: - PKCE (C4 / C5)
 
     func testCreateLoginURLContainsPKCEChallenge() {
         let oidc = makeOIDC()
@@ -219,20 +252,31 @@ final class OIDCLiteTests: XCTestCase {
     }
 
     func testCodeVerifierMeetsRFC7636LengthRequirements() {
-        // RFC 7636 §4.1: code_verifier must be 43–128 characters
         let oidc = makeOIDC()
+        _ = oidc.createLoginURL() // verifier is generated here
         let len = oidc.codeVerifier.count
         XCTAssertGreaterThanOrEqual(len, 43, "code_verifier too short (RFC 7636 min: 43)")
         XCTAssertLessThanOrEqual(len, 128, "code_verifier too long (RFC 7636 max: 128)")
     }
 
     func testCodeVerifierIsUniquePerInstance() {
-        let v1 = makeOIDC().codeVerifier
-        let v2 = makeOIDC().codeVerifier
-        XCTAssertNotEqual(v1, v2)
+        let oidc1 = makeOIDC()
+        let oidc2 = makeOIDC()
+        _ = oidc1.createLoginURL()
+        _ = oidc2.createLoginURL()
+        XCTAssertNotEqual(oidc1.codeVerifier, oidc2.codeVerifier)
     }
 
-    // MARK: - Nonce (replay protection)
+    func testCodeVerifierRegeneratedPerLoginURLCall() {
+        let oidc = makeOIDC()
+        _ = oidc.createLoginURL()
+        let v1 = oidc.codeVerifier
+        _ = oidc.createLoginURL()
+        let v2 = oidc.codeVerifier
+        XCTAssertNotEqual(v1, v2, "code_verifier must be regenerated for each authorization request (RFC 7636)")
+    }
+
+    // MARK: - Nonce (C3 / replay protection)
 
     func testCreateLoginURLContainsNonce() {
         let oidc = makeOIDC()
@@ -248,19 +292,19 @@ final class OIDCLiteTests: XCTestCase {
         XCTAssertNotEqual(n1, n2, "Nonce must be unique per request to prevent replay attacks")
     }
 
-    // MARK: - Token response parsing
+    func testNonceIsStoredAfterCreateLoginURL() {
+        let oidc = makeOIDC()
+        _ = oidc.createLoginURL()
+        XCTAssertNotNil(oidc.nonce, "Nonce must be stored so it can be validated in the ID token")
+    }
+
+    // MARK: - Token response parsing (basic)
 
     func testProcessOIDCResponseParsesAccessToken() {
         let (oidc, delegate) = makeOIDCWithDelegate()
         oidc.processOIDCResponse(jsonData(["access_token": "test_at", "token_type": "Bearer"]))
         XCTAssertTrue(delegate.tokenResponseCalled)
         XCTAssertEqual(delegate.receivedTokens?.accessToken, "test_at")
-    }
-
-    func testProcessOIDCResponseParsesIDToken() {
-        let (oidc, delegate) = makeOIDCWithDelegate()
-        oidc.processOIDCResponse(jsonData(["access_token": "at", "id_token": "test_idt", "token_type": "Bearer"]))
-        XCTAssertEqual(delegate.receivedTokens?.idToken, "test_idt")
     }
 
     func testProcessOIDCResponseParsesRefreshToken() {
@@ -289,6 +333,91 @@ final class OIDCLiteTests: XCTestCase {
         XCTAssertNil(delegate.receivedTokens?.accessToken)
         XCTAssertNil(delegate.receivedTokens?.idToken)
         XCTAssertNil(delegate.receivedTokens?.refreshToken)
+    }
+
+    // MARK: - ID token claim validation (C1)
+
+    func testProcessOIDCResponseAcceptsValidIDToken() {
+        let (oidc, delegate) = makeOIDCWithDelegate()
+        _ = oidc.createLoginURL()
+        let token = makeJWT(oidc: oidc)
+        oidc.processOIDCResponse(jsonData(["access_token": "at", "id_token": token, "token_type": "Bearer"]))
+        XCTAssertTrue(delegate.tokenResponseCalled)
+        XCTAssertFalse(delegate.authFailureCalled)
+        XCTAssertEqual(delegate.receivedTokens?.idToken, token)
+    }
+
+    func testProcessOIDCResponseRejectsMalformedIDToken() {
+        let (oidc, delegate) = makeOIDCWithDelegate()
+        oidc.processOIDCResponse(jsonData(["access_token": "at", "id_token": "not.a.jwt.with.too.many.dots", "token_type": "Bearer"]))
+        XCTAssertTrue(delegate.authFailureCalled)
+        XCTAssertFalse(delegate.tokenResponseCalled)
+    }
+
+    func testProcessOIDCResponseRejectsExpiredIDToken() {
+        let (oidc, delegate) = makeOIDCWithDelegate()
+        _ = oidc.createLoginURL()
+        let expired = makeJWT(oidc: oidc, expOffset: -3600)
+        oidc.processOIDCResponse(jsonData(["access_token": "at", "id_token": expired, "token_type": "Bearer"]))
+        XCTAssertTrue(delegate.authFailureCalled)
+        XCTAssertFalse(delegate.tokenResponseCalled)
+        XCTAssertTrue(delegate.authFailureMessage?.contains("expired") ?? false)
+    }
+
+    func testProcessOIDCResponseRejectsWrongAudience() {
+        let (oidc, delegate) = makeOIDCWithDelegate()
+        _ = oidc.createLoginURL()
+        let wrongAud = makeJWT(oidc: oidc, overrideClaims: ["aud": "completely-different-client"])
+        oidc.processOIDCResponse(jsonData(["access_token": "at", "id_token": wrongAud, "token_type": "Bearer"]))
+        XCTAssertTrue(delegate.authFailureCalled)
+        XCTAssertTrue(delegate.authFailureMessage?.contains("audience") ?? false)
+    }
+
+    func testProcessOIDCResponseAcceptsArrayAudienceContainingClientID() {
+        let (oidc, delegate) = makeOIDCWithDelegate()
+        _ = oidc.createLoginURL()
+        let multiAud = makeJWT(oidc: oidc, overrideClaims: ["aud": [clientID, "other-resource"]])
+        oidc.processOIDCResponse(jsonData(["access_token": "at", "id_token": multiAud, "token_type": "Bearer"]))
+        XCTAssertTrue(delegate.tokenResponseCalled)
+        XCTAssertFalse(delegate.authFailureCalled)
+    }
+
+    func testProcessOIDCResponseRejectsWrongIssuer() {
+        let (oidc, delegate) = makeOIDCWithDelegate()
+        oidc.discoveredIssuer = "https://example.com"
+        _ = oidc.createLoginURL()
+        let wrongIss = makeJWT(oidc: oidc, overrideClaims: ["iss": "https://evil.example.com"])
+        oidc.processOIDCResponse(jsonData(["access_token": "at", "id_token": wrongIss, "token_type": "Bearer"]))
+        XCTAssertTrue(delegate.authFailureCalled)
+        XCTAssertTrue(delegate.authFailureMessage?.contains("issuer") ?? false)
+    }
+
+    func testProcessOIDCResponseAcceptsMatchingIssuer() {
+        let (oidc, delegate) = makeOIDCWithDelegate()
+        oidc.discoveredIssuer = "https://example.com"
+        _ = oidc.createLoginURL()
+        let goodIss = makeJWT(oidc: oidc, overrideClaims: ["iss": "https://example.com"])
+        oidc.processOIDCResponse(jsonData(["access_token": "at", "id_token": goodIss, "token_type": "Bearer"]))
+        XCTAssertTrue(delegate.tokenResponseCalled)
+        XCTAssertFalse(delegate.authFailureCalled)
+    }
+
+    func testProcessOIDCResponseRejectsNonceMismatch() {
+        let (oidc, delegate) = makeOIDCWithDelegate()
+        _ = oidc.createLoginURL()
+        let wrongNonce = makeJWT(oidc: oidc, overrideClaims: ["nonce": "attacker-nonce"])
+        oidc.processOIDCResponse(jsonData(["access_token": "at", "id_token": wrongNonce, "token_type": "Bearer"]))
+        XCTAssertTrue(delegate.authFailureCalled)
+        XCTAssertTrue(delegate.authFailureMessage?.contains("nonce") ?? false)
+    }
+
+    func testProcessOIDCResponseClearsNonceAfterValidation() {
+        let (oidc, delegate) = makeOIDCWithDelegate()
+        _ = oidc.createLoginURL()
+        let token = makeJWT(oidc: oidc)
+        oidc.processOIDCResponse(jsonData(["access_token": "at", "id_token": token, "token_type": "Bearer"]))
+        XCTAssertTrue(delegate.tokenResponseCalled)
+        XCTAssertNil(oidc.nonce, "Nonce must be cleared after successful validation to prevent reuse")
     }
 
     // MARK: - base64URLEncoded
@@ -348,5 +477,21 @@ final class OIDCLiteTests: XCTestCase {
 
     private func jsonData(_ dict: [String: Any]) -> Data {
         return try! JSONSerialization.data(withJSONObject: dict)
+    }
+
+    /// Build a minimal signed-looking JWT for testing claim validation.
+    /// `overrideClaims` replaces individual claims; nonce and aud default to oidc's values.
+    private func makeJWT(oidc: OIDCLite, overrideClaims: [String: Any] = [:], expOffset: TimeInterval = 3600) -> String {
+        let header = Data(#"{"alg":"RS256","typ":"JWT"}"#.utf8).base64EncodedString().base64URLEncoded()
+        var claims: [String: Any] = [
+            "iss": "https://example.com",
+            "aud": oidc.clientID,
+            "exp": Date().timeIntervalSince1970 + expOffset,
+            "iat": Date().timeIntervalSince1970,
+        ]
+        if let storedNonce = oidc.nonce { claims["nonce"] = storedNonce }
+        for (k, v) in overrideClaims { claims[k] = v }
+        let payload = (try! JSONSerialization.data(withJSONObject: claims)).base64EncodedString().base64URLEncoded()
+        return "\(header).\(payload).fakesig"
     }
 }
