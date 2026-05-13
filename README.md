@@ -21,7 +21,7 @@ OIDCLite implements the Authorization Code flow with PKCE (S256) via `ASWebAuthe
 - Resource Owner Password Grant (ROPG) with optional override-error routing
 - Ephemeral `URLSession` — no shared cookies, cache, or credentials
 
-> **Note on JWS:** Signature verification is not performed. Claims validation (`exp`, `aud`, `iss`, `nonce`) is enforced, but token authenticity depends on the TLS connection to the token endpoint. Add JWKS validation on top of this package if your threat model requires it.
+> **On JWS signature verification:** Claims validation (`exp`, `aud`, `iss`, `nonce`) is always enforced. Cryptographic signature verification is available via `validateIDTokenSignature(_:)` but is optional — see [JWT signature verification](#jwt-signature-verification) below.
 
 ---
 
@@ -30,7 +30,7 @@ OIDCLite implements the Authorization Code flow with PKCE (S256) via `ASWebAuthe
 ```swift
 // Package.swift
 dependencies: [
-    .package(url: "https://github.com/twocanoes/OIDCLite", from: "1.0.0")
+    .package(url: "https://github.com/mactroll/OIDCLite", from: "1.0.0")
 ]
 ```
 
@@ -207,6 +207,45 @@ let oidc = OIDCLite(
 
 ---
 
+## JWT signature verification
+
+OIDCLite always validates ID token **claims** (`exp`, `aud`, `iss`, `nonce`). Cryptographic **signature** verification is a separate, optional step available via `validateIDTokenSignature(_:)`.
+
+### When you don't need it
+
+If your app receives tokens directly from the token endpoint over HTTPS, TLS provides the channel guarantee. An attacker who can't intercept the TLS connection also can't forge a token, so claim validation alone is sufficient for most deployments.
+
+### When you do need it
+
+Call `validateIDTokenSignature` when:
+- The token passed through an intermediary (a proxy, a backend-for-frontend, a broker) before reaching your app
+- Your security policy or compliance requirement mandates cryptographic verification
+- You're storing tokens and re-validating them later, outside the context of the original TLS session
+
+### Usage (macOS 12+ / iOS 15+)
+
+`validateIDTokenSignature` fetches the issuer's JWKS, finds the key matching the token's `kid`, and verifies the signature. It requires `getEndpoints()` to have been called first (the JWKS URI is read from the discovery document).
+
+```swift
+@available(macOS 12.0, iOS 15.0, *)
+func verifyToken(_ idToken: String) async {
+    do {
+        try await oidc.validateIDTokenSignature(idToken)
+        print("Signature valid")
+    } catch let error as OIDCLiteError {
+        print("Signature invalid: \(error.localizedDescription)")
+    } catch {
+        print("Network error: \(error.localizedDescription)")
+    }
+}
+```
+
+Supported algorithms: **RS256**, **RS384**, **RS512**, **ES256**.
+
+Throws `OIDCLiteError.invalidIDToken` on verification failure, an unrecognised algorithm, or a network error fetching the JWKS.
+
+---
+
 ## WKWebView
 
 OIDCLite conforms to `WKNavigationDelegate`. Set it as the navigation delegate for your `WKWebView` and load the URL from `createLoginURL()`. State validation and token exchange happen automatically on the redirect.
@@ -226,7 +265,7 @@ webView.load(URLRequest(url: oidc.createLoginURL()!))
 | CSRF | Per-request random `state`, validated and consumed on redirect |
 | Replay protection | Per-request random `nonce`, validated and cleared after token delivery |
 | ID token claims | `exp`, `aud` (string or array), `iss`, `nonce` |
-| JWS signature verification | Not implemented — relies on TLS to the token endpoint |
+| JWS signature verification | Optional — `validateIDTokenSignature(_:)` (RS256/384/512, ES256) |
 | Session isolation | Ephemeral `URLSession`; no shared cookies, cache, or credential store |
 | POST body encoding | `application/x-www-form-urlencoded` via `URLComponents`; no string concatenation |
 | Basic auth encoding | RFC 6749 §2.3.1 percent-encoding before Base64 |

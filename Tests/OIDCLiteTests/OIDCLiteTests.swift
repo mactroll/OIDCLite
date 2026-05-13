@@ -1,4 +1,6 @@
 import XCTest
+import CryptoKit
+import Security
 @testable import OIDCLite
 
 // MARK: - Mock Delegate
@@ -71,6 +73,7 @@ final class OIDCLiteTests: XCTestCase {
     let clientSecret = "BBA8C549-49BB-49D6-A835-C9372C36C32F"
     let authEndpoint = "https://example.com/oauth/v2/auth"
     let tokenEndpoint = "https://example.com/oauth/v2/token"
+    let jwksURL = "https://example.com/.well-known/jwks.json"
 
     // MARK: - Init
 
@@ -685,6 +688,164 @@ final class OIDCLiteTests: XCTestCase {
         XCTAssertFalse(delegate.authFailureMessage?.contains("internal-trace") ?? true, "Non-standard fields must not leak to caller")
     }
 
+    // MARK: - JWT signature verification
+
+    @available(macOS 12.0, *)
+    func testValidateSignatureNoJWKSURI() async {
+        let (oidc, _) = makeOIDCWithMockSession()
+        // jwksURI intentionally not set — should throw before making any network call
+        do {
+            try await oidc.validateIDTokenSignature("a.b.c")
+            XCTFail("Expected invalidIDToken error")
+        } catch OIDCLiteError.invalidIDToken(let reason) {
+            XCTAssertTrue(reason.contains("JWKS URI"), "Got: \(reason)")
+        } catch {
+            XCTFail("Unexpected error type: \(error)")
+        }
+    }
+
+    @available(macOS 12.0, *)
+    func testValidateSignatureMalformedJWT() async {
+        let (oidc, _) = makeOIDCWithMockSession()
+        oidc.jwksURI = jwksURL
+        // Single part — no dots — should fail before any JWKS fetch
+        do {
+            try await oidc.validateIDTokenSignature("not-a-jwt")
+            XCTFail("Expected invalidIDToken error")
+        } catch OIDCLiteError.invalidIDToken(let reason) {
+            XCTAssertTrue(reason.contains("malformed"), "Got: \(reason)")
+        } catch {
+            XCTFail("Unexpected error type: \(error)")
+        }
+    }
+
+    @available(macOS 12.0, *)
+    func testValidateSignatureKidNotInJWKS() async throws {
+        let (oidc, _) = makeOIDCWithMockSession()
+        oidc.jwksURI = jwksURL
+        let key = P256.Signing.PrivateKey()
+        // JWT signed with kid "expected-kid"; JWKS only has kid "different-kid"
+        let jwt = try makeES256SignedJWT(claims: [:], kid: "expected-kid", privateKey: key)
+        let jwk = makeES256JWK(publicKey: key.publicKey, kid: "different-kid")
+        MockURLProtocol.requestHandler = { _ in (self.makeJWKSResponse(), self.makeJWKSData(keys: [jwk])) }
+        do {
+            try await oidc.validateIDTokenSignature(jwt)
+            XCTFail("Expected invalidIDToken error")
+        } catch OIDCLiteError.invalidIDToken(let reason) {
+            XCTAssertTrue(reason.contains("expected-kid"), "Error should name the missing kid. Got: \(reason)")
+        } catch {
+            XCTFail("Unexpected error type: \(error)")
+        }
+    }
+
+    @available(macOS 12.0, *)
+    func testValidateSignatureUnsupportedAlgorithm() async throws {
+        let (oidc, _) = makeOIDCWithMockSession()
+        oidc.jwksURI = jwksURL
+        // JWT header claims HS256 (unsupported); no kid so key lookup falls back to first JWKS entry
+        let key = P256.Signing.PrivateKey()
+        let header = Data(#"{"alg":"HS256","typ":"JWT"}"#.utf8).base64EncodedString().base64URLEncoded()
+        let payload = Data(#"{"sub":"test"}"#.utf8).base64EncodedString().base64URLEncoded()
+        let jwt = "\(header).\(payload).fakesig"
+        let jwk = makeES256JWK(publicKey: key.publicKey, kid: "k1")
+        MockURLProtocol.requestHandler = { _ in (self.makeJWKSResponse(), self.makeJWKSData(keys: [jwk])) }
+        do {
+            try await oidc.validateIDTokenSignature(jwt)
+            XCTFail("Expected invalidIDToken error")
+        } catch OIDCLiteError.invalidIDToken(let reason) {
+            XCTAssertTrue(reason.contains("HS256"), "Error should name the algorithm. Got: \(reason)")
+        } catch {
+            XCTFail("Unexpected error type: \(error)")
+        }
+    }
+
+    @available(macOS 12.0, *)
+    func testValidateSignatureES256Valid() async throws {
+        let (oidc, _) = makeOIDCWithMockSession()
+        oidc.jwksURI = jwksURL
+        let key = P256.Signing.PrivateKey()
+        let jwt = try makeES256SignedJWT(claims: ["sub": "user1"], kid: "k1", privateKey: key)
+        let jwk = makeES256JWK(publicKey: key.publicKey, kid: "k1")
+        MockURLProtocol.requestHandler = { _ in (self.makeJWKSResponse(), self.makeJWKSData(keys: [jwk])) }
+        try await oidc.validateIDTokenSignature(jwt)
+    }
+
+    @available(macOS 12.0, *)
+    func testValidateSignatureES256WrongKey() async throws {
+        let (oidc, _) = makeOIDCWithMockSession()
+        oidc.jwksURI = jwksURL
+        let signingKey = P256.Signing.PrivateKey()
+        let differentKey = P256.Signing.PrivateKey()
+        let jwt = try makeES256SignedJWT(claims: ["sub": "user1"], kid: "k1", privateKey: signingKey)
+        let jwk = makeES256JWK(publicKey: differentKey.publicKey, kid: "k1") // wrong public key
+        MockURLProtocol.requestHandler = { _ in (self.makeJWKSResponse(), self.makeJWKSData(keys: [jwk])) }
+        do {
+            try await oidc.validateIDTokenSignature(jwt)
+            XCTFail("Expected invalidIDToken error for mismatched key")
+        } catch OIDCLiteError.invalidIDToken(let reason) {
+            XCTAssertTrue(reason.contains("EC signature"), "Got: \(reason)")
+        } catch {
+            XCTFail("Unexpected error type: \(error)")
+        }
+    }
+
+    @available(macOS 12.0, *)
+    func testValidateSignatureRS256Valid() async throws {
+        let (oidc, _) = makeOIDCWithMockSession()
+        oidc.jwksURI = jwksURL
+        let (privKey, pubKey) = try makeRS256KeyPair()
+        let jwt = try makeRS256SignedJWT(claims: ["sub": "user1"], kid: "rsa1", privateKey: privKey)
+        let jwk = try makeRS256JWK(publicKey: pubKey, kid: "rsa1")
+        MockURLProtocol.requestHandler = { _ in (self.makeJWKSResponse(), self.makeJWKSData(keys: [jwk])) }
+        try await oidc.validateIDTokenSignature(jwt)
+    }
+
+    @available(macOS 12.0, *)
+    func testValidateSignatureRS256WrongKey() async throws {
+        let (oidc, _) = makeOIDCWithMockSession()
+        oidc.jwksURI = jwksURL
+        let (signingPriv, _) = try makeRS256KeyPair()
+        let (_, verifyPub) = try makeRS256KeyPair() // separate key pair
+        let jwt = try makeRS256SignedJWT(claims: ["sub": "user1"], kid: "rsa1", privateKey: signingPriv)
+        let jwk = try makeRS256JWK(publicKey: verifyPub, kid: "rsa1") // wrong public key
+        MockURLProtocol.requestHandler = { _ in (self.makeJWKSResponse(), self.makeJWKSData(keys: [jwk])) }
+        do {
+            try await oidc.validateIDTokenSignature(jwt)
+            XCTFail("Expected invalidIDToken error for mismatched key")
+        } catch OIDCLiteError.invalidIDToken(let reason) {
+            XCTAssertTrue(reason.contains("RSA signature"), "Got: \(reason)")
+        } catch {
+            XCTFail("Unexpected error type: \(error)")
+        }
+    }
+
+    @available(macOS 12.0, *)
+    func testValidateSignatureSelectsKeyByKid() async throws {
+        let (oidc, _) = makeOIDCWithMockSession()
+        oidc.jwksURI = jwksURL
+        let keyA = P256.Signing.PrivateKey()
+        let keyB = P256.Signing.PrivateKey()
+        // JWT is signed by keyB with kid "key-b"; JWKS has both keys
+        let jwt = try makeES256SignedJWT(claims: ["sub": "user1"], kid: "key-b", privateKey: keyB)
+        let jwkA = makeES256JWK(publicKey: keyA.publicKey, kid: "key-a")
+        let jwkB = makeES256JWK(publicKey: keyB.publicKey, kid: "key-b")
+        MockURLProtocol.requestHandler = { _ in (self.makeJWKSResponse(), self.makeJWKSData(keys: [jwkA, jwkB])) }
+        // Should succeed: kid "key-b" selects jwkB, which matches the signing key
+        try await oidc.validateIDTokenSignature(jwt)
+    }
+
+    @available(macOS 12.0, *)
+    func testValidateSignatureNoKidUsesFirstKey() async throws {
+        let (oidc, _) = makeOIDCWithMockSession()
+        oidc.jwksURI = jwksURL
+        let key = P256.Signing.PrivateKey()
+        // JWT has no kid in header — should fall back to first JWKS key
+        let jwt = try makeES256SignedJWT(claims: ["sub": "user1"], kid: nil, privateKey: key)
+        let jwk = makeES256JWK(publicKey: key.publicKey, kid: "only-key")
+        MockURLProtocol.requestHandler = { _ in (self.makeJWKSResponse(), self.makeJWKSData(keys: [jwk])) }
+        try await oidc.validateIDTokenSignature(jwt)
+    }
+
     // MARK: - Helpers
 
     private func makeOIDC(redirectURI: String? = nil, scopes: [String]? = nil) -> OIDCLite {
@@ -779,6 +940,100 @@ final class OIDCLiteTests: XCTestCase {
             result[key] = value
         }
         return result
+    }
+
+    // MARK: Signature-test helpers
+
+    private func makeJWKSResponse() -> HTTPURLResponse {
+        HTTPURLResponse(url: URL(string: jwksURL)!, statusCode: 200, httpVersion: nil, headerFields: nil)!
+    }
+
+    private func makeJWKSData(keys: [[String: Any]]) -> Data {
+        try! JSONSerialization.data(withJSONObject: ["keys": keys])
+    }
+
+    private func makeES256JWK(publicKey: P256.Signing.PublicKey, kid: String) -> [String: Any] {
+        let bytes = [UInt8](publicKey.x963Representation) // 0x04 || x(32) || y(32)
+        return [
+            "kty": "EC", "crv": "P-256", "kid": kid, "use": "sig", "alg": "ES256",
+            "x": Data(bytes[1...32]).base64EncodedString().base64URLEncoded(),
+            "y": Data(bytes[33...64]).base64EncodedString().base64URLEncoded(),
+        ]
+    }
+
+    private func makeES256SignedJWT(claims: [String: Any], kid: String?,
+                                    privateKey: P256.Signing.PrivateKey) throws -> String {
+        var hdr: [String: Any] = ["alg": "ES256", "typ": "JWT"]
+        if let kid = kid { hdr["kid"] = kid }
+        let h = try! JSONSerialization.data(withJSONObject: hdr).base64EncodedString().base64URLEncoded()
+        let p = try! JSONSerialization.data(withJSONObject: claims).base64EncodedString().base64URLEncoded()
+        let input = "\(h).\(p)"
+        let sig = try privateKey.signature(for: Data(input.utf8))
+            .rawRepresentation.base64EncodedString().base64URLEncoded()
+        return "\(input).\(sig)"
+    }
+
+    private func makeRS256KeyPair() throws -> (SecKey, SecKey) {
+        let attrs: [String: Any] = [
+            kSecAttrKeyType as String: kSecAttrKeyTypeRSA,
+            kSecAttrKeySizeInBits as String: 2048,
+        ]
+        var cfErr: Unmanaged<CFError>?
+        guard let priv = SecKeyCreateRandomKey(attrs as CFDictionary, &cfErr),
+              let pub = SecKeyCopyPublicKey(priv) else {
+            throw cfErr!.takeRetainedValue()
+        }
+        return (priv, pub)
+    }
+
+    /// Extract the n and e components from a PKCS#1 RSA public key DER blob.
+    private func parseRSAPublicKeyComponents(_ pubKey: SecKey) throws -> (n: Data, e: Data) {
+        var cfErr: Unmanaged<CFError>?
+        guard let der = SecKeyCopyExternalRepresentation(pubKey, &cfErr) as Data? else {
+            throw cfErr!.takeRetainedValue()
+        }
+        var pos = 0
+        let b = [UInt8](der)
+        func readLen() -> Int {
+            let first = Int(b[pos]); pos += 1
+            guard first >= 0x80 else { return first }
+            let nBytes = first & 0x7F; var len = 0
+            for _ in 0..<nBytes { len = (len << 8) | Int(b[pos]); pos += 1 }
+            return len
+        }
+        func readInt() -> Data {
+            pos += 1 // INTEGER tag
+            let len = readLen()
+            var v = Data(b[pos..<pos + len]); pos += len
+            if v.count > 1, v.first == 0x00 { v = Data(v.dropFirst()) } // strip DER sign byte
+            return v
+        }
+        pos += 1; _ = readLen() // SEQUENCE tag + length
+        return (readInt(), readInt())
+    }
+
+    private func makeRS256JWK(publicKey: SecKey, kid: String) throws -> [String: Any] {
+        let (n, e) = try parseRSAPublicKeyComponents(publicKey)
+        return [
+            "kty": "RSA", "kid": kid, "use": "sig", "alg": "RS256",
+            "n": n.base64EncodedString().base64URLEncoded(),
+            "e": e.base64EncodedString().base64URLEncoded(),
+        ]
+    }
+
+    private func makeRS256SignedJWT(claims: [String: Any], kid: String?,
+                                    privateKey: SecKey) throws -> String {
+        var hdr: [String: Any] = ["alg": "RS256", "typ": "JWT"]
+        if let kid = kid { hdr["kid"] = kid }
+        let h = try! JSONSerialization.data(withJSONObject: hdr).base64EncodedString().base64URLEncoded()
+        let p = try! JSONSerialization.data(withJSONObject: claims).base64EncodedString().base64URLEncoded()
+        let input = "\(h).\(p)"
+        var cfErr: Unmanaged<CFError>?
+        guard let sig = SecKeyCreateSignature(
+            privateKey, .rsaSignatureMessagePKCS1v15SHA256,
+            Data(input.utf8) as CFData, &cfErr
+        ) as Data? else { throw cfErr!.takeRetainedValue() }
+        return "\(input).\(sig.base64EncodedString().base64URLEncoded())"
     }
 
     /// Build a minimal signed-looking JWT for testing claim validation.
