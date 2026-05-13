@@ -8,19 +8,63 @@ final class MockOIDCLiteDelegate: OIDCLiteDelegate {
     var authFailureMessage: String?
     var tokenResponseCalled = false
     var authFailureCalled = false
+    var ropgSuccessCalled = false
+    var ropgSuccessMessage: String?
+    var onCompletion: (() -> Void)?
 
     func authFailure(message: String) {
         authFailureMessage = message
         authFailureCalled = true
+        onCompletion?()
     }
 
     func tokenResponse(tokens: OIDCLite.TokenResponse) {
         receivedTokens = tokens
         tokenResponseCalled = true
+        onCompletion?()
+    }
+
+    func ropgSuccess(errorMessage: String) {
+        ropgSuccessCalled = true
+        ropgSuccessMessage = errorMessage
+        onCompletion?()
     }
 }
 
+// Intercepts URLSession requests so tests can inspect outgoing requests without hitting the network.
+final class MockURLProtocol: URLProtocol {
+    static var requestHandler: ((URLRequest) throws -> (HTTPURLResponse, Data))?
+    static var capturedRequest: URLRequest?
+
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+    override func startLoading() {
+        MockURLProtocol.capturedRequest = request
+        guard let handler = MockURLProtocol.requestHandler else {
+            client?.urlProtocol(self, didFailWithError: URLError(.unsupportedURL))
+            return
+        }
+        do {
+            let (response, data) = try handler(request)
+            client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+            client?.urlProtocol(self, didLoad: data)
+            client?.urlProtocolDidFinishLoading(self)
+        } catch {
+            client?.urlProtocol(self, didFailWithError: error)
+        }
+    }
+
+    override func stopLoading() {}
+}
+
 final class OIDCLiteTests: XCTestCase {
+
+    override func setUp() {
+        super.setUp()
+        MockURLProtocol.capturedRequest = nil
+        MockURLProtocol.requestHandler = nil
+    }
 
     let discoveryURL = "https://example.com/.well-known/openid-configuration"
     let clientID = "BC76BE32-289C-4A56-B5F2-ACAB2B695EDB"
@@ -445,6 +489,202 @@ final class OIDCLiteTests: XCTestCase {
         XCTAssertFalse(result.contains("="))
     }
 
+    // MARK: - TokenResponse extended fields
+
+    func testProcessOIDCResponseParsesExpiresInAsInt() {
+        let (oidc, delegate) = makeOIDCWithDelegate()
+        oidc.processOIDCResponse(jsonData(["access_token": "at", "token_type": "Bearer", "expires_in": 3600]))
+        XCTAssertEqual(delegate.receivedTokens?.expiresIn, 3600)
+    }
+
+    func testProcessOIDCResponseParsesExpiresInAsString() {
+        let (oidc, delegate) = makeOIDCWithDelegate()
+        oidc.processOIDCResponse(jsonData(["access_token": "at", "token_type": "Bearer", "expires_in": "7200"]))
+        XCTAssertEqual(delegate.receivedTokens?.expiresIn, 7200)
+    }
+
+    func testProcessOIDCResponseExpiresInNilWhenAbsent() {
+        let (oidc, delegate) = makeOIDCWithDelegate()
+        oidc.processOIDCResponse(jsonData(["access_token": "at", "token_type": "Bearer"]))
+        XCTAssertNil(delegate.receivedTokens?.expiresIn)
+    }
+
+    func testProcessOIDCResponseParsesTokenType() {
+        let (oidc, delegate) = makeOIDCWithDelegate()
+        oidc.processOIDCResponse(jsonData(["access_token": "at", "token_type": "Bearer"]))
+        XCTAssertEqual(delegate.receivedTokens?.tokenType, "Bearer")
+    }
+
+    func testProcessOIDCResponseDefaultsTokenTypeWhenAbsent() {
+        let (oidc, delegate) = makeOIDCWithDelegate()
+        oidc.processOIDCResponse(jsonData(["access_token": "at"]))
+        XCTAssertEqual(delegate.receivedTokens?.tokenType, "bearer")
+    }
+
+    func testProcessOIDCResponseParsesScope() {
+        let (oidc, delegate) = makeOIDCWithDelegate()
+        oidc.processOIDCResponse(jsonData(["access_token": "at", "token_type": "Bearer", "scope": "openid profile"]))
+        XCTAssertEqual(delegate.receivedTokens?.scope, "openid profile")
+    }
+
+    func testProcessOIDCResponseScopeNilWhenAbsent() {
+        let (oidc, delegate) = makeOIDCWithDelegate()
+        oidc.processOIDCResponse(jsonData(["access_token": "at", "token_type": "Bearer"]))
+        XCTAssertNil(delegate.receivedTokens?.scope)
+    }
+
+    // MARK: - getToken request structure (H1 / basic-auth feature)
+
+    func testGetTokenWithBasicAuthSetsAuthorizationHeader() {
+        let (oidc, delegate) = makeOIDCWithMockSession(secret: clientSecret)
+        MockURLProtocol.requestHandler = { _ in (self.makeHTTPResponse(), self.tokenSuccessData()) }
+        _ = oidc.createLoginURL()
+        waitForDelegate(delegate) { oidc.getToken(code: "abc", basicAuth: true) }
+        let header = MockURLProtocol.capturedRequest?.value(forHTTPHeaderField: "Authorization")
+        XCTAssertNotNil(header, "Authorization header must be set when basicAuth is true")
+        XCTAssertTrue(header?.hasPrefix("Basic ") ?? false)
+    }
+
+    func testGetTokenWithBasicAuthHeaderEncodesClientIDAndSecret() {
+        let (oidc, delegate) = makeOIDCWithMockSession(secret: clientSecret)
+        MockURLProtocol.requestHandler = { _ in (self.makeHTTPResponse(), self.tokenSuccessData()) }
+        _ = oidc.createLoginURL()
+        waitForDelegate(delegate) { oidc.getToken(code: "abc", basicAuth: true) }
+        let header = MockURLProtocol.capturedRequest?.value(forHTTPHeaderField: "Authorization") ?? ""
+        let b64 = String(header.dropFirst("Basic ".count))
+        let decoded = String(data: Data(base64Encoded: b64) ?? Data(), encoding: .utf8) ?? ""
+        XCTAssertTrue(decoded.contains(clientID), "Authorization header must contain clientID")
+        XCTAssertTrue(decoded.contains(clientSecret), "Authorization header must contain clientSecret")
+    }
+
+    func testGetTokenWithBasicAuthOmitsClientSecretFromBody() {
+        let (oidc, delegate) = makeOIDCWithMockSession(secret: clientSecret)
+        MockURLProtocol.requestHandler = { _ in (self.makeHTTPResponse(), self.tokenSuccessData()) }
+        _ = oidc.createLoginURL()
+        waitForDelegate(delegate) { oidc.getToken(code: "abc", basicAuth: true) }
+        let body = rawFormBody(from: MockURLProtocol.capturedRequest)
+        XCTAssertFalse(body.contains("client_secret"), "client_secret must not appear in body when using Basic auth (RFC 6749 §2.3)")
+    }
+
+    func testGetTokenWithoutBasicAuthIncludesClientSecretInBody() {
+        let (oidc, delegate) = makeOIDCWithMockSession(secret: clientSecret)
+        MockURLProtocol.requestHandler = { _ in (self.makeHTTPResponse(), self.tokenSuccessData()) }
+        _ = oidc.createLoginURL()
+        waitForDelegate(delegate) { oidc.getToken(code: "abc", basicAuth: false) }
+        let params = parseFormBody(from: MockURLProtocol.capturedRequest)
+        XCTAssertEqual(params["client_secret"], clientSecret)
+    }
+
+    func testGetTokenWithoutBasicAuthHasNoAuthorizationHeader() {
+        let (oidc, delegate) = makeOIDCWithMockSession(secret: clientSecret)
+        MockURLProtocol.requestHandler = { _ in (self.makeHTTPResponse(), self.tokenSuccessData()) }
+        _ = oidc.createLoginURL()
+        waitForDelegate(delegate) { oidc.getToken(code: "abc", basicAuth: false) }
+        XCTAssertNil(MockURLProtocol.capturedRequest?.value(forHTTPHeaderField: "Authorization"))
+    }
+
+    func testGetTokenBodyContainsGrantType() {
+        let (oidc, delegate) = makeOIDCWithMockSession()
+        MockURLProtocol.requestHandler = { _ in (self.makeHTTPResponse(), self.tokenSuccessData()) }
+        _ = oidc.createLoginURL()
+        waitForDelegate(delegate) { oidc.getToken(code: "abc") }
+        XCTAssertEqual(parseFormBody(from: MockURLProtocol.capturedRequest)["grant_type"], "authorization_code")
+    }
+
+    func testGetTokenBodyContainsCodeVerifier() {
+        let (oidc, delegate) = makeOIDCWithMockSession()
+        MockURLProtocol.requestHandler = { _ in (self.makeHTTPResponse(), self.tokenSuccessData()) }
+        _ = oidc.createLoginURL()
+        let verifier = oidc.codeVerifier
+        waitForDelegate(delegate) { oidc.getToken(code: "abc") }
+        XCTAssertEqual(parseFormBody(from: MockURLProtocol.capturedRequest)["code_verifier"], verifier)
+    }
+
+    // MARK: - refreshTokens URL encoding (H1)
+
+    func testRefreshTokensPercentEncodesSpecialCharsInToken() {
+        let (oidc, delegate) = makeOIDCWithMockSession()
+        MockURLProtocol.requestHandler = { _ in (self.makeHTTPResponse(), self.tokenSuccessData()) }
+        waitForDelegate(delegate) { oidc.refreshTokens("a&b=c") }
+        let body = rawFormBody(from: MockURLProtocol.capturedRequest)
+        XCTAssertFalse(body.contains("refresh_token=a&b=c"), "Unencoded & would corrupt the POST body")
+        XCTAssertTrue(body.contains("refresh_token=a%26b%3Dc"), "& must encode to %26, = must encode to %3D")
+    }
+
+    // MARK: - requestTokenWithROPG request structure (H5)
+
+    func testROPGSyncUsesBasicAuthHeader() {
+        let (oidc, delegate) = makeOIDCWithMockSession(secret: clientSecret)
+        MockURLProtocol.requestHandler = { _ in (self.makeHTTPResponse(), self.tokenSuccessData()) }
+        waitForDelegate(delegate) { oidc.requestTokenWithROPG(username: "user", password: "pass") }
+        let header = MockURLProtocol.capturedRequest?.value(forHTTPHeaderField: "Authorization")
+        XCTAssertTrue(header?.hasPrefix("Basic ") ?? false, "ROPG must use HTTP Basic auth per RFC 6749 §2.3")
+    }
+
+    func testROPGSyncBodyOmitsClientCredentials() {
+        let (oidc, delegate) = makeOIDCWithMockSession(secret: clientSecret)
+        MockURLProtocol.requestHandler = { _ in (self.makeHTTPResponse(), self.tokenSuccessData()) }
+        waitForDelegate(delegate) { oidc.requestTokenWithROPG(username: "user", password: "pass") }
+        let body = rawFormBody(from: MockURLProtocol.capturedRequest)
+        XCTAssertFalse(body.contains("client_secret"), "ROPG must not include client_secret in body when using Basic auth")
+        XCTAssertFalse(body.contains("client_id"), "ROPG must not include client_id in body when using Basic auth")
+    }
+
+    func testROPGSyncBodyContainsGrantTypePassword() {
+        let (oidc, delegate) = makeOIDCWithMockSession()
+        MockURLProtocol.requestHandler = { _ in (self.makeHTTPResponse(), self.tokenSuccessData()) }
+        waitForDelegate(delegate) { oidc.requestTokenWithROPG(username: "user", password: "pass") }
+        XCTAssertEqual(parseFormBody(from: MockURLProtocol.capturedRequest)["grant_type"], "password")
+    }
+
+    func testROPGSyncBodyContainsUsernameAndPassword() {
+        let (oidc, delegate) = makeOIDCWithMockSession()
+        MockURLProtocol.requestHandler = { _ in (self.makeHTTPResponse(), self.tokenSuccessData()) }
+        waitForDelegate(delegate) { oidc.requestTokenWithROPG(username: "testuser", password: "testpass") }
+        let params = parseFormBody(from: MockURLProtocol.capturedRequest)
+        XCTAssertEqual(params["username"], "testuser")
+        XCTAssertEqual(params["password"], "testpass")
+    }
+
+    // MARK: - OAuth error message scoping (H4)
+
+    func testOAuthErrorIncludesErrorCode() {
+        let (oidc, delegate) = makeOIDCWithMockSession()
+        MockURLProtocol.requestHandler = { _ in
+            (self.makeHTTPResponse(status: 401), self.jsonData(["error": "invalid_client", "error_description": "Bad credentials"]))
+        }
+        waitForDelegate(delegate) { oidc.getToken(code: "abc") }
+        XCTAssertTrue(delegate.authFailureMessage?.contains("invalid_client") ?? false)
+    }
+
+    func testOAuthErrorIncludesDescription() {
+        let (oidc, delegate) = makeOIDCWithMockSession()
+        MockURLProtocol.requestHandler = { _ in
+            (self.makeHTTPResponse(status: 401), self.jsonData(["error": "invalid_client", "error_description": "Bad credentials"]))
+        }
+        waitForDelegate(delegate) { oidc.getToken(code: "abc") }
+        XCTAssertTrue(delegate.authFailureMessage?.contains("Bad credentials") ?? false)
+    }
+
+    func testOAuthErrorIncludesErrorURI() {
+        let (oidc, delegate) = makeOIDCWithMockSession()
+        MockURLProtocol.requestHandler = { _ in
+            (self.makeHTTPResponse(status: 400), self.jsonData(["error": "invalid_request", "error_uri": "https://example.com/errors/invalid_request"]))
+        }
+        waitForDelegate(delegate) { oidc.getToken(code: "abc") }
+        XCTAssertTrue(delegate.authFailureMessage?.contains("https://example.com/errors/invalid_request") ?? false)
+    }
+
+    func testOAuthErrorExcludesNonStandardFields() {
+        let (oidc, delegate) = makeOIDCWithMockSession()
+        MockURLProtocol.requestHandler = { _ in
+            (self.makeHTTPResponse(status: 500), self.jsonData(["error": "server_error", "correlation_id": "secret-id", "trace": "internal-trace"]))
+        }
+        waitForDelegate(delegate) { oidc.getToken(code: "abc") }
+        XCTAssertFalse(delegate.authFailureMessage?.contains("secret-id") ?? true, "Non-standard fields must not leak to caller")
+        XCTAssertFalse(delegate.authFailureMessage?.contains("internal-trace") ?? true, "Non-standard fields must not leak to caller")
+    }
+
     // MARK: - Helpers
 
     private func makeOIDC(redirectURI: String? = nil, scopes: [String]? = nil) -> OIDCLite {
@@ -477,6 +717,68 @@ final class OIDCLiteTests: XCTestCase {
 
     private func jsonData(_ dict: [String: Any]) -> Data {
         return try! JSONSerialization.data(withJSONObject: dict)
+    }
+
+    private func makeOIDCWithMockSession(secret: String? = nil) -> (OIDCLite, MockOIDCLiteDelegate) {
+        let oidc = OIDCLite(discoveryURL: discoveryURL, clientID: clientID, clientSecret: secret, redirectURI: nil, scopes: nil)
+        oidc.OIDCAuthEndpoint = authEndpoint
+        oidc.OIDCTokenEndpoint = tokenEndpoint
+        let config = URLSessionConfiguration.ephemeral
+        config.protocolClasses = [MockURLProtocol.self]
+        oidc.session = URLSession(configuration: config, delegate: nil, delegateQueue: nil)
+        let delegate = MockOIDCLiteDelegate()
+        oidc.delegate = delegate
+        return (oidc, delegate)
+    }
+
+    private func waitForDelegate(_ delegate: MockOIDCLiteDelegate, block: () -> Void) {
+        let exp = expectation(description: "delegate callback")
+        delegate.onCompletion = { exp.fulfill() }
+        block()
+        wait(for: [exp], timeout: 2)
+    }
+
+    private func tokenSuccessData() -> Data {
+        jsonData(["access_token": "at123", "token_type": "Bearer"])
+    }
+
+    private func makeHTTPResponse(status: Int = 200) -> HTTPURLResponse {
+        HTTPURLResponse(url: URL(string: tokenEndpoint)!, statusCode: status, httpVersion: nil, headerFields: nil)!
+    }
+
+    /// Returns the raw (percent-encoded) form body string from a request.
+    /// URLSession converts httpBody to httpBodyStream internally, so we check both.
+    private func rawFormBody(from request: URLRequest?) -> String {
+        guard let request = request else { return "" }
+        if let body = request.httpBody {
+            return String(data: body, encoding: .utf8) ?? ""
+        }
+        if let stream = request.httpBodyStream {
+            stream.open()
+            var data = Data()
+            var buffer = [UInt8](repeating: 0, count: 4096)
+            while stream.hasBytesAvailable {
+                let count = stream.read(&buffer, maxLength: buffer.count)
+                if count > 0 { data.append(contentsOf: buffer[..<count]) }
+            }
+            stream.close()
+            return String(data: data, encoding: .utf8) ?? ""
+        }
+        return ""
+    }
+
+    /// Splits a form body into key → raw-encoded-value pairs (splits on first `=` per pair).
+    private func parseFormBody(from request: URLRequest?) -> [String: String] {
+        let str = rawFormBody(from: request)
+        guard !str.isEmpty else { return [:] }
+        var result: [String: String] = [:]
+        for pair in str.components(separatedBy: "&") {
+            guard let eqRange = pair.range(of: "=") else { continue }
+            let key = String(pair[pair.startIndex..<eqRange.lowerBound])
+            let value = String(pair[eqRange.upperBound...])
+            result[key] = value
+        }
+        return result
     }
 
     /// Build a minimal signed-looking JWT for testing claim validation.
