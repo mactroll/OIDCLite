@@ -362,7 +362,9 @@ public class OIDCLite: NSObject {
     }
 
     /// Exchange an authorization code for tokens.
-    public func getToken(code: String) {
+    /// When `basicAuth` is true, client credentials go in the Authorization header
+    /// (RFC 6749 §2.3.1); otherwise they go in the POST body.
+    public func getToken(code: String, basicAuth: Bool = false) {
         guard let path = tokenEndpoint else {
             delegate?.authFailure(message: "No token endpoint found")
             return
@@ -379,7 +381,7 @@ public class OIDCLite: NSObject {
             ("code", code),
             ("code_verifier", codeVerifier),
         ]
-        if let secret = clientSecret {
+        if let secret = clientSecret, !basicAuth {
             params.append(("client_secret", secret))
         }
 
@@ -390,6 +392,9 @@ public class OIDCLite: NSObject {
             "Accept": "application/json",
             "Content-Type": "application/x-www-form-urlencoded",
         ]
+        if basicAuth, let header = basicAuthHeader() {
+            req.setValue(header, forHTTPHeaderField: "Authorization")
+        }
 
         dataTask = session.dataTask(with: req) { data, response, error in
             if let error = error {
