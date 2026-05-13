@@ -12,6 +12,13 @@ public enum OIDCLiteTokenResult {
 public protocol OIDCLiteDelegate {
     func authFailure(message: String)
     func tokenResponse(tokens: OIDCLite.TokenResponse)
+    func ropgSuccess(errorMessage: String)
+}
+
+@available(macOS 11.0, *)
+public extension OIDCLiteDelegate {
+    // Default no-op so existing implementations don't need to add ropgSuccess
+    func ropgSuccess(errorMessage: String) {}
 }
 
 @propertyWrapper
@@ -33,10 +40,13 @@ struct IntConvertible: Decodable {
 extension CharacterSet {
     static let urlQueryValueAllowed: CharacterSet = {
         // https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/encodeURIComponent
+        // https://url.spec.whatwg.org/#concept-urlencoded
+        // A-z0-9 and '*.-_' are allowed
         let generalDelimitersToEncode = ":#[]@?/"
         let subDelimitersToEncode = "!$&'()+,;=~"
         var allowed = CharacterSet.urlQueryAllowed
         allowed.remove(charactersIn: "\(generalDelimitersToEncode)\(subDelimitersToEncode)")
+        // replace space with + afterwards
         allowed.insert(charactersIn: " ")
         return allowed
     }()
@@ -64,7 +74,28 @@ public class OIDCLite: NSObject {
         public var accessToken: String?
         public var idToken: String?
         public var refreshToken: String?
+        public var expiresIn: Int?
+        public var tokenType: String
+        public var scope: String?
         public var jsonDict: [String: Any]?
+
+        public init(
+            accessToken: String? = nil,
+            idToken: String? = nil,
+            refreshToken: String? = nil,
+            expiresIn: Int? = nil,
+            tokenType: String = "bearer",
+            scope: String? = nil,
+            jsonDict: [String: Any]? = nil
+        ) {
+            self.accessToken = accessToken
+            self.idToken = idToken
+            self.refreshToken = refreshToken
+            self.expiresIn = expiresIn
+            self.tokenType = tokenType
+            self.scope = scope
+            self.jsonDict = jsonDict
+        }
     }
 
     public let kRedirectURI = "oidclite://openID"
@@ -225,6 +256,18 @@ public class OIDCLite: NSObject {
 
             var tokenResponse = TokenResponse()
 
+            tokenResponse.tokenType = jsonResult["token_type"] as? String ?? "bearer"
+
+            if let expiresInt = jsonResult["expires_in"] as? Int {
+                tokenResponse.expiresIn = expiresInt
+            } else if let expiresStr = jsonResult["expires_in"] as? String, let expiresInt = Int(expiresStr) {
+                tokenResponse.expiresIn = expiresInt
+            }
+
+            if let scope = jsonResult["scope"] as? String {
+                tokenResponse.scope = scope
+            }
+
             if let accessToken = jsonResult["access_token"] as? String {
                 tokenResponse.accessToken = accessToken
             }
@@ -249,7 +292,7 @@ public class OIDCLite: NSObject {
 
     // NOTE: Signature verification (JWS/JWKS) is not performed. Claims validation
     // (exp, aud, iss, nonce) is enforced but the token's authenticity depends on TLS
-    // to the token endpoint. Callers should add signature verification for full C1 compliance.
+    // to the token endpoint. Callers should add signature verification for full security.
     private func validateIDTokenClaims(_ idToken: String) -> OIDCLiteError? {
         let parts = idToken.components(separatedBy: ".")
         guard parts.count == 3 else {
@@ -309,6 +352,15 @@ public class OIDCLite: NSObject {
         params.map { "\($0.0)=\(formEncode($0.1))" }.joined(separator: "&").data(using: .utf8)
     }
 
+    // Percent-encode client credentials for HTTP Basic auth per RFC 6749 §2.3.1
+    private func basicAuthHeader() -> String? {
+        let encodedClientID = clientID.addingPercentEncoding(withAllowedCharacters: .urlQueryValueAllowed) ?? clientID
+        let encodedSecret = clientSecret?.addingPercentEncoding(withAllowedCharacters: .urlQueryValueAllowed) ?? ""
+        let credentials = encodedSecret.isEmpty ? encodedClientID : "\(encodedClientID):\(encodedSecret)"
+        guard let data = credentials.data(using: .utf8) else { return nil }
+        return "Basic \(data.base64EncodedString())"
+    }
+
     /// Exchange an authorization code for tokens.
     public func getToken(code: String) {
         guard let path = tokenEndpoint else {
@@ -366,7 +418,55 @@ public class OIDCLite: NSObject {
         dataTask?.resume()
     }
 
-    /// Fetch the authorization and token endpoints from the discovery document.
+    /// Async variant. When `basicAuth` is true, client credentials go in the
+    /// Authorization header (RFC 6749 §2.3.1); otherwise they go in the POST body.
+    @available(macOS 12.0, *)
+    public func getToken(code: String, basicAuth: Bool = false) async throws {
+        guard let path = tokenEndpoint else {
+            delegate?.authFailure(message: "No token endpoint found")
+            return
+        }
+        guard let tokenURL = URL(string: path) else {
+            delegate?.authFailure(message: "Unable to make the token endpoint into a URL")
+            return
+        }
+
+        var params: [(String, String)] = [
+            ("grant_type", "authorization_code"),
+            ("client_id", clientID),
+            ("redirect_uri", redirectURI),
+            ("code", code),
+            ("code_verifier", codeVerifier),
+        ]
+
+        var req = URLRequest(url: tokenURL)
+        req.httpMethod = "POST"
+        req.allHTTPHeaderFields = [
+            "Accept": "application/json",
+            "Content-Type": "application/x-www-form-urlencoded",
+        ]
+
+        if basicAuth, let header = basicAuthHeader() {
+            req.setValue(header, forHTTPHeaderField: "Authorization")
+        } else if let secret = clientSecret {
+            params.append(("client_secret", secret))
+        }
+
+        req.httpBody = buildFormBody(params)
+
+        let (data, response) = try await session.data(for: req)
+        guard let httpResponse = response as? HTTPURLResponse, (200..<300).contains(httpResponse.statusCode) else {
+            if let jsonResult = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                delegate?.authFailure(message: oauthErrorMessage(dict: jsonResult))
+            } else {
+                delegate?.authFailure(message: "HTTP error from token endpoint")
+            }
+            return
+        }
+        processOIDCResponse(data)
+    }
+
+    /// Fetch the authorization and token endpoints from the discovery document (blocking).
     public func getEndpoints() {
         guard let host = URL(string: discoveryURL) else {
             delegate?.authFailure(message: "Invalid discovery URL: \(discoveryURL)")
@@ -399,10 +499,37 @@ public class OIDCLite: NSObject {
                 self.authorizationEndpoint = json["authorization_endpoint"] as? String ?? ""
                 self.tokenEndpoint = json["token_endpoint"] as? String ?? ""
                 self.discoveredIssuer = json["issuer"] as? String
+            } else {
+                self.delegate?.authFailure(message: "Unable to parse discovery endpoint")
             }
         }.resume()
 
         sema.wait()
+    }
+
+    /// Async variant — throws on network or parse failure.
+    @available(macOS 12.0, *)
+    public func getEndpoints() async throws {
+        guard let host = URL(string: discoveryURL) else {
+            throw OIDCLiteError.unableToLoadEndpoint
+        }
+        var req = URLRequest(url: host)
+        req.allHTTPHeaderFields = [
+            "Accept": "application/json",
+            "Cache-Control": "no-cache",
+        ]
+        req.httpMethod = "GET"
+
+        let (data, response) = try await session.data(for: req)
+        guard let httpResponse = response as? HTTPURLResponse, (200..<300).contains(httpResponse.statusCode) else {
+            throw OIDCLiteError.unableToLoadEndpoint
+        }
+        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw OIDCLiteError.unableToParseEndpoint
+        }
+        authorizationEndpoint = json["authorization_endpoint"] as? String ?? ""
+        tokenEndpoint = json["token_endpoint"] as? String ?? ""
+        discoveredIssuer = json["issuer"] as? String
     }
 
     /// Parse the redirect callback URL, validate state, and exchange the code for tokens.
@@ -477,22 +604,19 @@ public class OIDCLite: NSObject {
         }.resume()
     }
 
+    /// ROPG (Resource Owner Password Grant). Client credentials are sent via Basic auth only
+    /// per RFC 6749 §2.3 — use one authentication method per request.
     public func requestTokenWithROPG(username: String, password: String) {
         guard let urlString = tokenEndpoint, let url = URL(string: urlString) else {
             delegate?.authFailure(message: "Token endpoint not set")
             return
         }
 
-        // RFC 6749 §2.3.1: percent-encode credentials before base64 for Basic auth
-        let encodedClientID = clientID.addingPercentEncoding(withAllowedCharacters: .urlQueryValueAllowed) ?? clientID
-        let encodedSecret = clientSecret?.addingPercentEncoding(withAllowedCharacters: .urlQueryValueAllowed) ?? ""
-        let basicCredentials = encodedSecret.isEmpty ? encodedClientID : "\(encodedClientID):\(encodedSecret)"
-        guard let credentialsData = basicCredentials.data(using: .utf8) else {
+        guard let header = basicAuthHeader() else {
             delegate?.authFailure(message: "Unable to encode credentials")
             return
         }
 
-        // RFC 6749 §2.3: use one authentication method only; client creds are in Basic header
         var params: [(String, String)] = [
             ("grant_type", "password"),
             ("username", username),
@@ -506,7 +630,7 @@ public class OIDCLite: NSObject {
         var req = URLRequest(url: url)
         req.httpMethod = "POST"
         req.httpBody = buildFormBody(params)
-        req.setValue("Basic \(credentialsData.base64EncodedString())", forHTTPHeaderField: "Authorization")
+        req.setValue(header, forHTTPHeaderField: "Authorization")
         req.addValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
         req.addValue("application/json", forHTTPHeaderField: "Accept")
 
@@ -531,6 +655,72 @@ public class OIDCLite: NSObject {
             }
             self.processOIDCResponse(data)
         }.resume()
+    }
+
+    /// Async ROPG variant. `basicAuth` controls whether credentials go in the Authorization
+    /// header (true, default) or the POST body (false). `overrideErrors` lists raw 4xx
+    /// response bodies that should be surfaced as `ropgSuccess` rather than `authFailure`
+    /// — useful for handling "password expired" responses as a distinct success path.
+    @available(macOS 12.0, *)
+    public func requestTokenWithROPG(
+        username: String,
+        password: String,
+        basicAuth: Bool = true,
+        overrideErrors: [String]? = nil
+    ) async throws {
+        guard let urlString = tokenEndpoint, let url = URL(string: urlString) else {
+            delegate?.authFailure(message: "Token endpoint not set")
+            return
+        }
+
+        var params: [(String, String)] = [
+            ("grant_type", "password"),
+            ("username", username),
+            ("password", password),
+            ("scope", scopes.joined(separator: " ")),
+        ]
+        if let resource = resource {
+            params.append(("resource", resource))
+        }
+
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.allHTTPHeaderFields = [
+            "Accept": "application/json",
+            "Content-Type": "application/x-www-form-urlencoded",
+        ]
+
+        if basicAuth {
+            guard let header = basicAuthHeader() else {
+                delegate?.authFailure(message: "Unable to encode credentials")
+                return
+            }
+            req.setValue(header, forHTTPHeaderField: "Authorization")
+        } else {
+            params.append(("client_id", clientID))
+            if let secret = clientSecret {
+                params.append(("client_secret", secret))
+            }
+        }
+
+        req.httpBody = buildFormBody(params)
+
+        let (data, response) = try await session.data(for: req)
+        guard let httpResponse = response as? HTTPURLResponse else {
+            delegate?.authFailure(message: "Invalid response from token endpoint")
+            return
+        }
+
+        if (200..<300).contains(httpResponse.statusCode) {
+            processOIDCResponse(data)
+        } else if (400..<404).contains(httpResponse.statusCode),
+                  let overrideErrors = overrideErrors,
+                  let errorMessage = String(data: data, encoding: .utf8),
+                  overrideErrors.contains(errorMessage) {
+            delegate?.ropgSuccess(errorMessage: errorMessage)
+        } else {
+            delegate?.authFailure(message: String(data: data, encoding: .utf8) ?? "ROPG request failed")
+        }
     }
 
     // Surface only the standard OAuth error fields (RFC 6749 §5.2) to avoid leaking
