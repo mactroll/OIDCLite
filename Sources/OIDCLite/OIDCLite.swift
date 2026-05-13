@@ -37,6 +37,17 @@ struct IntConvertible: Decodable {
     }
 }
 
+private extension Data {
+    init?(base64URLEncoded string: String) {
+        var b64 = string
+            .replacingOccurrences(of: "-", with: "+")
+            .replacingOccurrences(of: "_", with: "/")
+        let pad = b64.count % 4
+        if pad != 0 { b64 += String(repeating: "=", count: 4 - pad) }
+        self.init(base64Encoded: b64)
+    }
+}
+
 extension CharacterSet {
     static let urlQueryValueAllowed: CharacterSet = {
         // https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/encodeURIComponent
@@ -138,6 +149,8 @@ public class OIDCLite: NSObject {
     var nonce: String?
     // Populated from the "issuer" field in the discovery document
     var discoveredIssuer: String?
+    // Populated from the "jwks_uri" field; used by validateIDTokenSignature(_:)
+    var jwksURI: String?
 
     private let queryItemKeys = OIDCQueryItemKeys()
 
@@ -504,6 +517,7 @@ public class OIDCLite: NSObject {
                 self.authorizationEndpoint = json["authorization_endpoint"] as? String ?? ""
                 self.tokenEndpoint = json["token_endpoint"] as? String ?? ""
                 self.discoveredIssuer = json["issuer"] as? String
+                self.jwksURI = json["jwks_uri"] as? String
             } else {
                 self.delegate?.authFailure(message: "Unable to parse discovery endpoint")
             }
@@ -535,6 +549,7 @@ public class OIDCLite: NSObject {
         authorizationEndpoint = json["authorization_endpoint"] as? String ?? ""
         tokenEndpoint = json["token_endpoint"] as? String ?? ""
         discoveredIssuer = json["issuer"] as? String
+        jwksURI = json["jwks_uri"] as? String
     }
 
     /// Parse the redirect callback URL, validate state, and exchange the code for tokens.
@@ -726,6 +741,152 @@ public class OIDCLite: NSObject {
         } else {
             delegate?.authFailure(message: String(data: data, encoding: .utf8) ?? "ROPG request failed")
         }
+    }
+
+    /// Verifies the JWS signature of an ID token against the issuer's JWKS endpoint.
+    ///
+    /// OIDCLite always validates ID token claims (exp, aud, iss, nonce). Call this
+    /// function when you also need to verify the cryptographic signature — for example,
+    /// if the token passed through an intermediary rather than arriving directly from
+    /// the token endpoint over TLS, or if your security policy requires it.
+    ///
+    /// If you receive tokens directly from the token endpoint over HTTPS, TLS already
+    /// guarantees the channel and claim validation is sufficient for most use cases.
+    ///
+    /// Requires `getEndpoints()` to have been called first (the JWKS URI comes from
+    /// the discovery document). Supported algorithms: RS256, RS384, RS512, ES256.
+    ///
+    /// - Parameter idToken: The raw ID token string from a `TokenResponse`.
+    /// - Throws: `OIDCLiteError.invalidIDToken` if the signature does not verify, the
+    ///   JWKS cannot be fetched, or the algorithm is unsupported.
+    @available(macOS 12.0, *)
+    public func validateIDTokenSignature(_ idToken: String) async throws {
+        guard let jwksURIString = jwksURI, let jwksURL = URL(string: jwksURIString) else {
+            throw OIDCLiteError.invalidIDToken("JWKS URI not available — call getEndpoints() first")
+        }
+
+        let parts = idToken.components(separatedBy: ".")
+        guard parts.count == 3 else {
+            throw OIDCLiteError.invalidIDToken("malformed JWT structure")
+        }
+
+        guard let headerData = Data(base64URLEncoded: parts[0]),
+              let header = try? JSONSerialization.jsonObject(with: headerData) as? [String: Any] else {
+            throw OIDCLiteError.invalidIDToken("unable to decode token header")
+        }
+        let alg = header["alg"] as? String ?? ""
+        let kid = header["kid"] as? String
+
+        let (jwksData, jwksResponse) = try await session.data(from: jwksURL)
+        guard let httpResponse = jwksResponse as? HTTPURLResponse,
+              (200..<300).contains(httpResponse.statusCode) else {
+            throw OIDCLiteError.invalidIDToken("unable to fetch JWKS")
+        }
+        guard let jwks = try? JSONSerialization.jsonObject(with: jwksData) as? [String: Any],
+              let keys = jwks["keys"] as? [[String: Any]] else {
+            throw OIDCLiteError.invalidIDToken("unable to parse JWKS")
+        }
+
+        let signingKey: [String: Any]
+        if let kid {
+            guard let match = keys.first(where: { $0["kid"] as? String == kid }) else {
+                throw OIDCLiteError.invalidIDToken("no JWKS key found for kid '\(kid)'")
+            }
+            signingKey = match
+        } else {
+            guard let first = keys.first else {
+                throw OIDCLiteError.invalidIDToken("JWKS contains no keys")
+            }
+            signingKey = first
+        }
+
+        let signingInput = Data("\(parts[0]).\(parts[1])".utf8)
+        guard let signatureData = Data(base64URLEncoded: parts[2]) else {
+            throw OIDCLiteError.invalidIDToken("unable to decode token signature")
+        }
+
+        switch alg {
+        case "RS256":
+            try verifyRSASignature(jwk: signingKey, data: signingInput, signature: signatureData,
+                                   algorithm: .rsaSignatureMessagePKCS1v15SHA256)
+        case "RS384":
+            try verifyRSASignature(jwk: signingKey, data: signingInput, signature: signatureData,
+                                   algorithm: .rsaSignatureMessagePKCS1v15SHA384)
+        case "RS512":
+            try verifyRSASignature(jwk: signingKey, data: signingInput, signature: signatureData,
+                                   algorithm: .rsaSignatureMessagePKCS1v15SHA512)
+        case "ES256":
+            try verifyECSignature(jwk: signingKey, data: signingInput, signature: signatureData)
+        default:
+            throw OIDCLiteError.invalidIDToken("unsupported signing algorithm '\(alg)'")
+        }
+    }
+
+    private func verifyRSASignature(jwk: [String: Any], data: Data, signature: Data,
+                                    algorithm: SecKeyAlgorithm) throws {
+        guard let nString = jwk["n"] as? String, let eString = jwk["e"] as? String,
+              let nData = Data(base64URLEncoded: nString),
+              let eData = Data(base64URLEncoded: eString) else {
+            throw OIDCLiteError.invalidIDToken("RSA JWK missing or invalid n/e components")
+        }
+        guard let keyData = buildDEREncodedRSAPublicKey(n: nData, e: eData) else {
+            throw OIDCLiteError.invalidIDToken("unable to construct RSA public key from JWK")
+        }
+        let attrs: [String: Any] = [
+            kSecAttrKeyType as String: kSecAttrKeyTypeRSA,
+            kSecAttrKeyClass as String: kSecAttrKeyClassPublic,
+        ]
+        var cfError: Unmanaged<CFError>?
+        guard let publicKey = SecKeyCreateWithData(keyData as CFData, attrs as CFDictionary, &cfError) else {
+            throw OIDCLiteError.invalidIDToken("unable to import RSA public key")
+        }
+        var verifyError: Unmanaged<CFError>?
+        guard SecKeyVerifySignature(publicKey, algorithm, data as CFData, signature as CFData, &verifyError) else {
+            throw OIDCLiteError.invalidIDToken("RSA signature verification failed")
+        }
+    }
+
+    private func verifyECSignature(jwk: [String: Any], data: Data, signature: Data) throws {
+        guard let xString = jwk["x"] as? String, let yString = jwk["y"] as? String,
+              let xData = Data(base64URLEncoded: xString),
+              let yData = Data(base64URLEncoded: yString) else {
+            throw OIDCLiteError.invalidIDToken("EC JWK missing or invalid x/y components")
+        }
+        // P-256 uncompressed point: 0x04 || x (32 bytes) || y (32 bytes)
+        let keyBytes = Data([0x04]) + xData + yData
+        let publicKey: P256.Signing.PublicKey
+        do {
+            publicKey = try P256.Signing.PublicKey(x963Representation: keyBytes)
+        } catch {
+            throw OIDCLiteError.invalidIDToken("unable to import EC public key")
+        }
+        // JWS ES256 uses IEEE P1363 format (r || s); CryptoKit's rawRepresentation matches this
+        let ecSignature: P256.Signing.ECDSASignature
+        do {
+            ecSignature = try P256.Signing.ECDSASignature(rawRepresentation: signature)
+        } catch {
+            throw OIDCLiteError.invalidIDToken("unable to decode EC signature")
+        }
+        guard publicKey.isValidSignature(ecSignature, for: data) else {
+            throw OIDCLiteError.invalidIDToken("EC signature verification failed")
+        }
+    }
+
+    // Encodes an RSA public key (n, e) as a PKCS#1 DER SEQUENCE for use with SecKeyCreateWithData.
+    private func buildDEREncodedRSAPublicKey(n: Data, e: Data) -> Data? {
+        func derLength(_ count: Int) -> Data {
+            if count < 128      { return Data([UInt8(count)]) }
+            else if count < 256 { return Data([0x81, UInt8(count)]) }
+            else                { return Data([0x82, UInt8(count >> 8), UInt8(count & 0xFF)]) }
+        }
+        func derInteger(_ raw: Data) -> Data {
+            var b = raw
+            while b.count > 1, b.first == 0x00 { b = b.dropFirst() }
+            if let first = b.first, first & 0x80 != 0 { b = Data([0x00]) + b }
+            return Data([0x02]) + derLength(b.count) + b
+        }
+        let contents = derInteger(n) + derInteger(e)
+        return Data([0x30]) + derLength(contents.count) + contents
     }
 
     // Surface only the standard OAuth error fields (RFC 6749 §5.2) to avoid leaking
